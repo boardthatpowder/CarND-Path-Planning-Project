@@ -7,18 +7,31 @@
 #include "Eigen-3.3/Eigen/QR"
 #include "helpers.h"
 #include "json.hpp"
+#include "spline.h"
 
 // for convenience
 using nlohmann::json;
+using std::cout;
+using std::endl;
 using std::string;
 using std::vector;
 
-int main() {
+const double MAX_SPEED = 49.9;
+const double ACCELERATION = .224 * 1.5;
+const double DECELERATION = .224;
+// const int SAFE_DISTANCE_SECONDS = 2;
+const int SAFE_DISTANCE_METRES_AHEAD = 20;
+const int SAFE_DISTANCE_METRES_BEHIND = -10;
+const int SAFE_MINIMUM_CHANGE_LANE_SPEED= 20;
+
+int main()
+{
   uWS::Hub h;
 
   // Load up map values for waypoint's x,y,s and d normalized normal vectors
   vector<double> map_waypoints_x;
   vector<double> map_waypoints_y;
+
   vector<double> map_waypoints_s;
   vector<double> map_waypoints_dx;
   vector<double> map_waypoints_dy;
@@ -31,7 +44,8 @@ int main() {
   std::ifstream in_map_(map_file_.c_str(), std::ifstream::in);
 
   string line;
-  while (getline(in_map_, line)) {
+  while (getline(in_map_, line))
+  {
     std::istringstream iss(line);
     double x;
     double y;
@@ -50,25 +64,33 @@ int main() {
     map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
-               &map_waypoints_dx,&map_waypoints_dy]
-              (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-               uWS::OpCode opCode) {
+  // DEAN:
+  int lane = 1;
+  double ref_vel = 0; // mph
+  // END
+
+  h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s,
+               &map_waypoints_dx, &map_waypoints_dy,
+               &lane, &ref_vel](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+                                uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
-    if (length && length > 2 && data[0] == '4' && data[1] == '2') {
+    if (length && length > 2 && data[0] == '4' && data[1] == '2')
+    {
 
       auto s = hasData(data);
 
-      if (s != "") {
+      if (s != "")
+      {
         auto j = json::parse(s);
-        
+
         string event = j[0].get<string>();
-        
-        if (event == "telemetry") {
+
+        if (event == "telemetry")
+        {
           // j[1] is the data JSON object
-          
+
           // Main car's localization Data
           double car_x = j[1]["x"];
           double car_y = j[1]["y"];
@@ -80,38 +102,303 @@ int main() {
           // Previous path data given to the Planner
           auto previous_path_x = j[1]["previous_path_x"];
           auto previous_path_y = j[1]["previous_path_y"];
-          // Previous path's end s and d values 
+          // Previous path's end s and d values
           double end_path_s = j[1]["end_path_s"];
           double end_path_d = j[1]["end_path_d"];
 
-          // Sensor Fusion Data, a list of all other cars on the same side 
+          // Sensor Fusion Data, a list of all other cars on the same side
           //   of the road.
           auto sensor_fusion = j[1]["sensor_fusion"];
 
-          json msgJson;
+          // DEAN:
+          int prev_size = previous_path_x.size();
+          if (prev_size > 0)
+          {
+            car_s = end_path_s;
+          }
+          
+          // double safe_distance_metres = car_speed * 0.44704 * SAFE_DISTANCE_SECONDS;  // 0.44704 is mph to m/s conversion
+          // cout << "safe_distance_metres: " << safe_distance_metres << endl;
 
+          // predict where the surrounding vehicles will be
+          bool obstacle_left = false, obstacle_right = false, obstacle_ahead = false;
+          double obstacle_ahead_distance = 999, obstacle_ahead_speed;
+          for (int i = 0; i < sensor_fusion.size(); i++)
+          {
+            // figure out which lane the other vehicle is in
+            float other_d = sensor_fusion[i][6];
+            int other_lane = other_d / 4;
+
+            // other vehicle kinematics...
+            double other_vx = sensor_fusion[i][3];
+            double other_vy = sensor_fusion[i][4];
+            double other_speed = sqrt(other_vx * other_vx + other_vy * other_vy);
+            double other_s = sensor_fusion[i][5];
+
+            // project the value out of the other vehicle
+            double other_s_projected = other_s + ((double)prev_size * .02 * other_speed);
+
+            // based on s and projected s, see if we end up being blocked by something
+
+            // obstacles based on road boundaries...
+            if (lane == 0) {
+              // if in the far left lane, we cantt move further left
+              obstacle_left = true;
+            } 
+            else if (lane == 2) {
+              // if in the far right lane, we cantt move further right
+              obstacle_right = true;
+            } 
+            
+            // obstacles based on other vehicles...
+            double other_distance = other_s - car_s;
+            double other_distance_projected = other_s_projected - car_s;
+            if (other_lane == (lane - 1))
+            {
+              // vehicle to our left, flag it as an obstacle if within a shorter safe driving distance, or just behind us
+              bool obstacle = ((other_distance >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance < SAFE_DISTANCE_METRES_AHEAD/2)) |
+                ((other_distance_projected >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance_projected < SAFE_DISTANCE_METRES_AHEAD/2));
+
+              obstacle_left |= obstacle;
+            }
+            else if (other_lane == lane)
+            {
+              
+              bool obstacle = ((other_distance >= 0) && (other_distance < SAFE_DISTANCE_METRES_AHEAD)) |
+                ((other_distance_projected >= 0) && (other_distance_projected < SAFE_DISTANCE_METRES_AHEAD));
+
+              // vehicle in our lane, flag it as an obstacle if within the safe driving distance,
+              obstacle_ahead |= obstacle;
+              if (obstacle_ahead) {
+                if (other_distance>=0 && other_distance < obstacle_ahead_distance) {
+                  obstacle_ahead_distance = other_distance;
+                  obstacle_ahead_speed = other_speed;
+                }
+              }
+            }
+            else if (other_lane == (lane + 1))
+            {
+              // vehicle to our right, flag it as an obstacle if within the safe driving distance, or just behind us
+              bool obstacle = ((other_distance >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance < SAFE_DISTANCE_METRES_AHEAD/2)) |
+                ((other_distance_projected >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance_projected < SAFE_DISTANCE_METRES_AHEAD/2));
+
+              obstacle_right |= obstacle; // | obstacle_rear;
+            }
+          }
+
+          // Based on the other predicted vehicles on the road, determine the behaviour to take
+          bool maintain_safe_distance=false;
+          string reason;
+          if (!obstacle_ahead)
+          {
+            if (lane < 2)
+            {
+              if (!obstacle_right && ref_vel > SAFE_MINIMUM_CHANGE_LANE_SPEED)
+              {
+                reason = "no obstacles ahead, so moving back right";
+                lane++;
+              }
+              else
+              {
+                reason = "no obstacles ahead, but can't move back right";
+              }
+            }
+            else
+            {
+              reason = "no obstacles ahead";
+            }
+          }
+          else
+          {
+            if (lane == 2)
+            {
+              if (!obstacle_left && ref_vel > SAFE_MINIMUM_CHANGE_LANE_SPEED) {
+                reason = "obstacles ahead, nothing to left, overtaking";
+                lane--;
+              } else {
+                reason = "obstacles ahead and left, maintaining safe distance";
+                maintain_safe_distance=true;
+              }
+            }
+            else if (lane >= 0)
+            {
+              if (!obstacle_right && ref_vel > SAFE_MINIMUM_CHANGE_LANE_SPEED)
+              {
+                reason = "obstacles ahead, nothing to right, so moving back right";
+                lane++;
+              }
+              else if (lane > 0 && !obstacle_left && ref_vel > SAFE_MINIMUM_CHANGE_LANE_SPEED)
+              {
+                reason = "obstacles ahead and right, nothing to left, overtaking";
+                lane--;
+              }
+              else
+              {
+                reason = "obstacles ahead and right, cannot move left, maintaining safe distance";
+                maintain_safe_distance=true;
+              }
+            }
+          }
+
+          if (maintain_safe_distance) {
+            // fine tune the speed to maintain a steady distance with the car in front
+            if (ref_vel > obstacle_ahead_speed || obstacle_ahead_distance < SAFE_DISTANCE_METRES_AHEAD) {
+              ref_vel -= DECELERATION;
+            }
+          } else {
+            ref_vel += ACCELERATION;
+          }
+
+          if (ref_vel > MAX_SPEED)
+          {
+            ref_vel = MAX_SPEED;
+          } 
+
+          cout << "s:" << car_s << ", d:" << car_d << ", \tobstacles left:" << obstacle_left << ", right:" << obstacle_right << ", ahead:" << obstacle_ahead << ", distance:" << obstacle_ahead_distance << ", speed:" << obstacle_ahead_speed << ". \tlane:" << lane << ", ref_vel:" << ref_vel << "\t" << reason << endl;
+
+          // finally, we can define the trajectory to take
+
+          // create list of widely spaced (x,y) waypoints, evenly sapced at 30m
+          // later we will interpolate these waypointd with a spline and fill it in with more points that control speed
+          vector<double> ptsx;
+          vector<double> ptsy;
+
+          // reference x,y,yaw states
+          // either we will reference the starting point as where the car is or at the previous paths end points
+          double ref_x = car_x;
+          double ref_y = car_y;
+          double ref_yaw = deg2rad(car_yaw);
+
+          // if previous size is almost empty, use the car as starting reference
+          if (prev_size < 2)
+          {
+            // use two points that make the path tangent to the car
+            double prev_car_x = car_x - cos(car_yaw);
+            double prev_car_y = car_y - sin(car_yaw);
+
+            ptsx.push_back(prev_car_x);
+            ptsx.push_back(car_x);
+
+            ptsy.push_back(prev_car_y);
+            ptsy.push_back(car_y);
+          }
+          else
+          {
+            // use the previous path's end point as startig reference
+
+            // redefine reference state as previous path end point
+            ref_x = previous_path_x[prev_size - 1];
+            ref_y = previous_path_y[prev_size - 1];
+
+            double ref_x_prev = previous_path_x[prev_size - 2];
+            double ref_y_prev = previous_path_y[prev_size - 2];
+            ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+
+            // use two points that make the path tangent to the previous path's end point
+            ptsx.push_back(ref_x_prev);
+            ptsx.push_back(ref_x);
+
+            ptsy.push_back(ref_y_prev);
+            ptsy.push_back(ref_y);
+          }
+
+          // In Frenet add evenly 30m spaced points ahead of the starting reference
+          vector<double> next_wp_0 = getXY(car_s + 30, (2 + 4 * lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          vector<double> next_wp_1 = getXY(car_s + 60, (2 + 4 * lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          vector<double> next_wp_2 = getXY(car_s + 90, (2 + 4 * lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+          ptsx.push_back(next_wp_0[0]);
+          ptsx.push_back(next_wp_1[0]);
+          ptsx.push_back(next_wp_2[0]);
+
+          ptsy.push_back(next_wp_0[1]);
+          ptsy.push_back(next_wp_1[1]);
+          ptsy.push_back(next_wp_2[1]);
+
+          for (int i = 0; i < ptsx.size(); i++)
+          {
+            // shift car reference angle to 0 degrees
+            double shift_x = ptsx[i] - ref_x;
+            double shift_y = ptsy[i] - ref_y;
+
+            ptsx[i] = (shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw));
+            ptsy[i] = (shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw));
+          }
+
+          // cout << "ptsx contains:";
+          // for (vector<double>::iterator it = ptsx.begin() ; it != ptsx.end(); ++it)
+          //   cout << "\t" << *it;
+
+          // cout << "ptsy contains:";
+          // for (vector<double>::iterator it = ptsy.begin() ; it != ptsy.end(); ++it)
+          //   cout << "\t" << *it;
+
+          // create a spline
+          tk::spline s;
+
+          // set (x,y) poonts to the spline
+          s.set_points(ptsx, ptsy);
+
+          // define the actual (x,y) points we will use for the planner
           vector<double> next_x_vals;
           vector<double> next_y_vals;
 
-          /**
-           * TODO: define a path made up of (x,y) points that the car will visit
-           *   sequentially every .02 seconds
-           */
+          // start with all of the previous path points from last time
+          for (int i = 0; i < previous_path_x.size(); i++)
+          {
+            next_x_vals.push_back(previous_path_x[i]);
+            next_y_vals.push_back(previous_path_y[i]);
+          }
 
+          // calculate how to break up spline points so that we travel at our desired velocity
+          double target_x = 30.0;
+          double target_y = s(target_x);
+          double target_dist = sqrt((target_x) * (target_x) + (target_y) * (target_y));
 
+          double x_add_on = 0;
+
+          // fill up the rest of our path planner after filling it with previous points, here we will always output 50 points
+          for (int i = 1; i <= 50 - previous_path_x.size(); i++)
+          {
+
+            double N = (target_dist / (.02 * ref_vel / 2.24)); // /2.24 converts from mph to m/s
+            double x_point = x_add_on + (target_x) / N;
+            double y_point = s(x_point);
+
+            x_add_on = x_point;
+
+            double x_ref = x_point;
+            double y_ref = y_point;
+
+            // rotate back to normal after rotating it earlier
+            x_point = (x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw));
+            y_point = (x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw));
+
+            x_point += ref_x;
+            y_point += ref_y;
+
+            next_x_vals.push_back(x_point);
+            next_y_vals.push_back(y_point);
+          }
+
+          // END
+
+          json msgJson;
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
 
-          auto msg = "42[\"control\","+ msgJson.dump()+"]";
+          auto msg = "42[\"control\"," + msgJson.dump() + "]";
 
           ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-        }  // end "telemetry" if
-      } else {
+        } // end "telemetry" if
+      }
+      else
+      {
         // Manual driving
         std::string msg = "42[\"manual\",{}]";
         ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
       }
-    }  // end websocket if
+    } // end websocket if
   }); // end h.onMessage
 
   h.onConnection([&h](uWS::WebSocket<uWS::SERVER> ws, uWS::HttpRequest req) {
@@ -125,12 +412,15 @@ int main() {
   });
 
   int port = 4567;
-  if (h.listen(port)) {
+  if (h.listen(port))
+  {
     std::cout << "Listening to port " << port << std::endl;
-  } else {
+  }
+  else
+  {
     std::cerr << "Failed to listen to port" << std::endl;
     return -1;
   }
-  
+
   h.run();
 }
