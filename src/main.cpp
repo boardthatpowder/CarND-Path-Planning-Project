@@ -17,12 +17,11 @@ using std::string;
 using std::vector;
 
 const double MAX_SPEED = 49.9;
-const double ACCELERATION = .224 * 1.5;
-const double DECELERATION = .224;
-// const int SAFE_DISTANCE_SECONDS = 2;
+const double ACCELERATION = .224 * 2;
+const double DECELERATION = .224 * 2;
 const int SAFE_DISTANCE_METRES_AHEAD = 20;
-const int SAFE_DISTANCE_METRES_BEHIND = -10;
-const int SAFE_MINIMUM_CHANGE_LANE_SPEED= 20;
+const int SAFE_DISTANCE_METRES_BEHIND = -5;
+const int SAFE_MINIMUM_CHANGE_LANE_SPEED = 20;
 
 int main()
 {
@@ -116,13 +115,13 @@ int main()
           {
             car_s = end_path_s;
           }
-          
+
           // double safe_distance_metres = car_speed * 0.44704 * SAFE_DISTANCE_SECONDS;  // 0.44704 is mph to m/s conversion
           // cout << "safe_distance_metres: " << safe_distance_metres << endl;
 
-          // predict where the surrounding vehicles will be
+          // predict where the surrounding vehicles will be to determine possible obstacles
           bool obstacle_left = false, obstacle_right = false, obstacle_ahead = false;
-          double obstacle_ahead_distance = 999, obstacle_ahead_speed;
+          double obstacle_ahead_distance = 999, obstacle_ahead_speed = 0;
           for (int i = 0; i < sensor_fusion.size(); i++)
           {
             // figure out which lane the other vehicle is in
@@ -141,36 +140,37 @@ int main()
             // based on s and projected s, see if we end up being blocked by something
 
             // obstacles based on road boundaries...
-            if (lane == 0) {
-              // if in the far left lane, we cantt move further left
+            if (lane == 0)
+            {
+              // if in the far left lane, we can't move any further left
               obstacle_left = true;
-            } 
-            else if (lane == 2) {
-              // if in the far right lane, we cantt move further right
+            }
+            else if (lane == 2)
+            {
+              // if in the far right lane, we can't move any further right
               obstacle_right = true;
-            } 
-            
+            }
+
             // obstacles based on other vehicles...
             double other_distance = other_s - car_s;
             double other_distance_projected = other_s_projected - car_s;
             if (other_lane == (lane - 1))
             {
               // vehicle to our left, flag it as an obstacle if within a shorter safe driving distance, or just behind us
-              bool obstacle = ((other_distance >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance < SAFE_DISTANCE_METRES_AHEAD/2)) |
-                ((other_distance_projected >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance_projected < SAFE_DISTANCE_METRES_AHEAD/2));
+              bool obstacle = ((other_distance_projected >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance_projected < SAFE_DISTANCE_METRES_AHEAD));
 
               obstacle_left |= obstacle;
             }
             else if (other_lane == lane)
             {
-              
-              bool obstacle = ((other_distance >= 0) && (other_distance < SAFE_DISTANCE_METRES_AHEAD)) |
-                ((other_distance_projected >= 0) && (other_distance_projected < SAFE_DISTANCE_METRES_AHEAD));
-
               // vehicle in our lane, flag it as an obstacle if within the safe driving distance,
+              bool obstacle = ((other_distance_projected >= 0) && (other_distance_projected < SAFE_DISTANCE_METRES_AHEAD));
+
               obstacle_ahead |= obstacle;
-              if (obstacle_ahead) {
-                if (other_distance>=0 && other_distance < obstacle_ahead_distance) {
+              if (obstacle)
+              {
+                if (other_distance >= 0 && other_distance < obstacle_ahead_distance)
+                {
                   obstacle_ahead_distance = other_distance;
                   obstacle_ahead_speed = other_speed;
                 }
@@ -179,80 +179,47 @@ int main()
             else if (other_lane == (lane + 1))
             {
               // vehicle to our right, flag it as an obstacle if within the safe driving distance, or just behind us
-              bool obstacle = ((other_distance >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance < SAFE_DISTANCE_METRES_AHEAD/2)) |
-                ((other_distance_projected >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance_projected < SAFE_DISTANCE_METRES_AHEAD/2));
+              bool obstacle = ((other_distance_projected >= SAFE_DISTANCE_METRES_BEHIND) && (other_distance_projected < SAFE_DISTANCE_METRES_AHEAD));
 
               obstacle_right |= obstacle; // | obstacle_rear;
             }
           }
 
           // Based on the other predicted vehicles on the road, determine the behaviour to take
-          bool maintain_safe_distance=false;
+          bool maintain_safe_distance = false;
           string reason;
-          if (!obstacle_ahead)
+          if (obstacle_ahead)
           {
-            if (lane < 2)
+            if (!obstacle_left)
             {
-              if (!obstacle_right && ref_vel > SAFE_MINIMUM_CHANGE_LANE_SPEED)
-              {
-                reason = "no obstacles ahead, so moving back right";
-                lane++;
-              }
-              else
-              {
-                reason = "no obstacles ahead, but can't move back right";
-              }
+              reason = "obstacles ahead, nothing to left, overtaking";
+              lane--;
+            }
+            else if (!obstacle_right)
+            {
+              reason = "obstacles ahead, nothing to right, undertaking";
+              lane++;
             }
             else
             {
-              reason = "no obstacles ahead";
-            }
-          }
-          else
-          {
-            if (lane == 2)
-            {
-              if (!obstacle_left && ref_vel > SAFE_MINIMUM_CHANGE_LANE_SPEED) {
-                reason = "obstacles ahead, nothing to left, overtaking";
-                lane--;
-              } else {
-                reason = "obstacles ahead and left, maintaining safe distance";
-                maintain_safe_distance=true;
-              }
-            }
-            else if (lane >= 0)
-            {
-              if (!obstacle_right && ref_vel > SAFE_MINIMUM_CHANGE_LANE_SPEED)
-              {
-                reason = "obstacles ahead, nothing to right, so moving back right";
-                lane++;
-              }
-              else if (lane > 0 && !obstacle_left && ref_vel > SAFE_MINIMUM_CHANGE_LANE_SPEED)
-              {
-                reason = "obstacles ahead and right, nothing to left, overtaking";
-                lane--;
-              }
-              else
-              {
-                reason = "obstacles ahead and right, cannot move left, maintaining safe distance";
-                maintain_safe_distance=true;
-              }
+              reason = "obstacles ahead and left, maintaining safe distance";
+              maintain_safe_distance = true;
             }
           }
 
-          if (maintain_safe_distance) {
-            // fine tune the speed to maintain a steady distance with the car in front
-            if (ref_vel > obstacle_ahead_speed || obstacle_ahead_distance < SAFE_DISTANCE_METRES_AHEAD) {
-              ref_vel -= DECELERATION;
-            }
-          } else {
+          if (maintain_safe_distance)
+          {
+            ref_vel -= DECELERATION;
+          }
+          else
+          {
             ref_vel += ACCELERATION;
           }
 
           if (ref_vel > MAX_SPEED)
           {
             ref_vel = MAX_SPEED;
-          } 
+          }
 
           cout << "s:" << car_s << ", d:" << car_d << ", \tobstacles left:" << obstacle_left << ", right:" << obstacle_right << ", ahead:" << obstacle_ahead << ", distance:" << obstacle_ahead_distance << ", speed:" << obstacle_ahead_speed << ". \tlane:" << lane << ", ref_vel:" << ref_vel << "\t" << reason << endl;
 
@@ -269,9 +236,9 @@ int main()
           double ref_y = car_y;
           double ref_yaw = deg2rad(car_yaw);
 
-          // if previous size is almost empty, use the car as starting reference
           if (prev_size < 2)
           {
+            // if previous size is almost empty, use the car as starting reference
             // use two points that make the path tangent to the car
             double prev_car_x = car_x - cos(car_yaw);
             double prev_car_y = car_y - sin(car_yaw);
@@ -284,7 +251,7 @@ int main()
           }
           else
           {
-            // use the previous path's end point as startig reference
+            // use the previous path's end point as starting reference
 
             // redefine reference state as previous path end point
             ref_x = previous_path_x[prev_size - 1];
